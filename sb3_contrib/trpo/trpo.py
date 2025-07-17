@@ -196,13 +196,16 @@ class TRPO(OnPolicyAlgorithm):
         # The list is used during the line-search to apply the step to each parameters
         actor_params: list[nn.Parameter] = []
 
+        # 遍历策略网络中的所有参数
         for name, param in self.policy.named_parameters():
             # Skip parameters related to value function based on name
             # this work for built-in policies only (not custom ones)
+            # 跳过价值函数的部分
             if "value" in name:
                 continue
 
             # For each parameter we compute the gradient of the KL divergence w.r.t to that parameter
+            # 借助pytorch框架计算参数对KL散度的梯度
             kl_param_grad, *_ = th.autograd.grad(
                 kl_div,
                 param,
@@ -213,18 +216,22 @@ class TRPO(OnPolicyAlgorithm):
             )
             # If the gradient is not zero (not None), we store the parameter in the actor_params list
             # and add the gradient and its shape to grad_kl and grad_shape respectively
+            # 梯度不为None，也就是说该参数确实影响KL散度
             if kl_param_grad is not None:
                 # If the parameter impacts the KL divergence (i.e. the policy)
                 # we compute the gradient of the policy objective w.r.t to the parameter
                 # this avoids computing the gradient if it's not going to be used in the conjugate gradient step
+                # 计算参数对策略目标的梯度
                 policy_objective_grad, *_ = th.autograd.grad(policy_objective, param, retain_graph=True, only_inputs=True)
 
+                # 记录梯度形状、KL散度梯度、策略目标梯度、参数
                 grad_shape.append(kl_param_grad.shape)
                 grad_kl_list.append(kl_param_grad.reshape(-1))
                 policy_objective_gradients_list.append(policy_objective_grad.reshape(-1))
                 actor_params.append(param)
 
         # Gradients are concatenated before the conjugate gradient step
+        # 拼接后返回
         policy_objective_gradients = th.cat(policy_objective_gradients_list)
         grad_kl = th.cat(grad_kl_list)
         return actor_params, policy_objective_gradients, grad_kl, grad_shape
@@ -232,6 +239,8 @@ class TRPO(OnPolicyAlgorithm):
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
+        实现主要参考了OpenAI Spinning Up的代码
+        https://spinningup.openai.com/en/latest/algorithms/trpo.html
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
@@ -244,8 +253,10 @@ class TRPO(OnPolicyAlgorithm):
         value_losses = []
 
         # This will only loop once (get all data in one go)
+        # batch_size设为None其实就是返回所有数据的意思
         for rollout_data in self.rollout_buffer.get(batch_size=None):
             # Optional: sub-sample data for faster computation
+            # 进一步采样，跳过
             if self.sub_sampling_factor > 1:
                 rollout_data = RolloutBufferSamples(
                     rollout_data.observations[:: self.sub_sampling_factor],
@@ -259,39 +270,52 @@ class TRPO(OnPolicyAlgorithm):
             actions = rollout_data.actions
             if isinstance(self.action_space, spaces.Discrete):
                 # Convert discrete action from float to long
+                # 离散action数据类型转换
                 actions = rollout_data.actions.long().flatten()
 
             with th.no_grad():
                 # Note: is copy enough, no need for deepcopy?
                 # If using gSDE and deepcopy, we need to use `old_distribution.distribution`
                 # directly to avoid PyTorch errors.
+                # 获取旧策略在给定观测状态下的动作概率分布
                 old_distribution = copy.copy(self.policy.get_distribution(rollout_data.observations))
 
+            # 当前策略在给定观测状态下的动作概率分布，并计算动作的对数概率
             distribution = self.policy.get_distribution(rollout_data.observations)
             log_prob = distribution.log_prob(actions)
 
+            # 获取优势，并进行标准化处理
+            # 这里的优势在buffer中已经计算好了，采用的方法是GAE
             advantages = rollout_data.advantages
             if self.normalize_advantage:
                 advantages = (advantages - advantages.mean()) / (rollout_data.advantages.std() + 1e-8)
 
             # ratio between old and new policy, should be one at the first iteration
+            # 策略比值，e的差次幂
             ratio = th.exp(log_prob - rollout_data.old_log_prob)
 
             # surrogate policy objective
+            # 比值乘以优势的部分，策略目标
             policy_objective = (advantages * ratio).mean()
 
             # KL divergence
+            # 新策略和旧策略之间的KL散度
             kl_div = kl_divergence(distribution, old_distribution).mean()
 
             # Surrogate & KL gradient
             self.policy.optimizer.zero_grad()
 
+            # 计算KL散度梯度和策略目标梯度
             actor_params, policy_objective_gradients, grad_kl, grad_shape = self._compute_actor_grad(kl_div, policy_objective)
 
             # Hessian-vector dot product function used in the conjugate gradient step
+            # 创建一个函数，用于共轭梯度求解器中，近似求解Fisher信息矩阵与向量的乘积
             hessian_vector_product_fn = partial(self.hessian_vector_product, actor_params, grad_kl)
 
             # Computing search direction
+            # 共轭梯度近似求解最优更新方向，这部分公式的推导可见论文附录C
+            # 也就是Fisher信息矩阵的逆矩阵H^{-1}与策略目标梯度g的乘积
+            # 由于逆矩阵计算量较大，采用共轭梯度近似求解
             search_direction = conjugate_gradient_solver(
                 hessian_vector_product_fn,
                 policy_objective_gradients,
@@ -299,23 +323,32 @@ class TRPO(OnPolicyAlgorithm):
             )
 
             # Maximal step length
+            # 计算最大步长
+            # 2倍目标KL散度值，常数超参数
             line_search_max_step_size = 2 * self.target_kl
+            # 分母部分，故意兜了个圈子，有兴趣的话可以尝试推导一下，(H^{-1}g)^T H H^{-1}g，也可以想想有没有更简单的写法
             line_search_max_step_size /= th.matmul(
                 search_direction, hessian_vector_product_fn(search_direction, retain_graph=False)
             )
+            # 开方得到线搜索步长
             line_search_max_step_size = th.sqrt(line_search_max_step_size)  # type: ignore[assignment, arg-type]
 
+            # 线搜索步长缩减系数
             line_search_backtrack_coeff = 1.0
+            # 保存原始参数，用于回溯
             original_actor_params = [param.detach().clone() for param in actor_params]
 
+            # flag
             is_line_search_success = False
             with th.no_grad():
                 # Line-search (backtracking)
-                for _ in range(self.line_search_max_iter):
+                for _ in range(self.line_search_max_iter): # 默认是10
                     start_idx = 0
                     # Applying the scaled step direction
+                    # 纯手动更新每一个参数
                     for param, original_param, shape in zip(actor_params, original_actor_params, grad_shape):
                         n_params = param.numel()
+                        # 与公式完全对应，更新参数
                         param.data = (
                             original_param.data
                             + line_search_backtrack_coeff
@@ -325,40 +358,47 @@ class TRPO(OnPolicyAlgorithm):
                         start_idx += n_params
 
                     # Recomputing the policy log-probabilities
+                    # 重新计算给定观测状态下的动作概率分布和对数动作概率
                     distribution = self.policy.get_distribution(rollout_data.observations)
                     log_prob = distribution.log_prob(actions)
 
                     # New policy objective
+                    # 策略比值，策略目标
                     ratio = th.exp(log_prob - rollout_data.old_log_prob)
                     new_policy_objective = (advantages * ratio).mean()
 
                     # New KL-divergence
+                    # KL散度
                     kl_div = kl_divergence(distribution, old_distribution).mean()
 
                     # Constraint criteria:
                     # we need to improve the surrogate policy objective
                     # while being close enough (in term of kl div) to the old policy
+                    # KL散度不能差太多，且策略目标确实有提升
                     if (kl_div < self.target_kl) and (new_policy_objective > policy_objective):
                         is_line_search_success = True
                         break
 
                     # Reducing step size if line-search wasn't successful
+                    # 步长缩减因子幂次递减，同样映射公式里的因子
                     line_search_backtrack_coeff *= self.line_search_shrinking_factor
 
                 line_search_results.append(is_line_search_success)
 
                 if not is_line_search_success:
                     # If the line-search wasn't successful we revert to the original parameters
+                    # 先搜索不成功则回溯参数
                     for param, original_param in zip(actor_params, original_actor_params):
                         param.data = original_param.data.clone()
 
                     policy_objective_values.append(policy_objective.item())
                     kl_divergences.append(0.0)
-                else:
+                else: # 记录数值作为log输出
                     policy_objective_values.append(new_policy_objective.item())
                     kl_divergences.append(kl_div.item())
 
         # Critic update
+        # 价值函数更新，就是普通的MSE
         for _ in range(self.n_critic_updates):
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 values_pred = self.policy.predict_values(rollout_data.observations)
